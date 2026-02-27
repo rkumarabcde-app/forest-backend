@@ -2,6 +2,3 @@ fastapi
 uvicorn
 earthengine-api
 python-multipart
-geopandas
-shapely
-fiona
