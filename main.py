@@ -189,6 +189,18 @@ async def forest_loss(
             buffer.write(await kml.read())
 
         aoi = kml_to_ee_geometry(kml_path)
+        aoi_area_m2 = aoi.area(maxError=1)
+        aoi_area_ha = aoi_area_m2.divide(10000)
+        area_ha = aoi_area_ha.getInfo()
+
+        if area_ha < 2000:
+            min_pixels = 20      # small block / village
+        elif area_ha < 10000:
+            min_pixels = 60      # sub-district
+        elif area_ha < 50000:
+            min_pixels = 100     # district
+        else:
+            min_pixels = 250     # very large district/state
 
         # ---------------------------
         # Date ranges (Oct–Nov window)
@@ -226,7 +238,7 @@ async def forest_loss(
 
         forest_loss = ndvi_change.lt(-0.2).selfMask()
         connected = forest_loss.connectedPixelCount(500, True)
-        forest_loss = forest_loss.updateMask(connected.gte(10))
+        forest_loss = forest_loss.updateMask(connected.gte(min_pixels))
 
         # Connected components
         clusters = forest_loss.connectedComponents(
