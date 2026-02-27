@@ -1,11 +1,9 @@
 import ee
-import geopandas as gpd
 import json
 import os
 import uuid
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from shapely.geometry import mapping
 
 # --------------------------------------------------
 # Environment & Earth Engine Initialization
