@@ -45,15 +45,43 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # Helper: Convert KML to EE Geometry
 # --------------------------------------------------
 
+import xml.etree.ElementTree as ET
+
 def kml_to_ee_geometry(kml_path):
-    gdf = gpd.read_file(kml_path, driver="KML")
-    if gdf.empty:
-        raise ValueError("Uploaded KML contains no geometry")
 
-    geom = gdf.geometry.unary_union
-    geojson = mapping(geom)
+    tree = ET.parse(kml_path)
+    root = tree.getroot()
 
-    return ee.Geometry(geojson)
+    # KML namespace handling
+    ns = {"kml": "http://www.opengis.net/kml/2.2"}
+
+    polygons = []
+
+    # Find all Polygon coordinate tags
+    for coords in root.findall(".//kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", ns):
+
+        coord_text = coords.text.strip()
+        points = []
+
+        for line in coord_text.split():
+            lon, lat, *_ = line.split(",")
+            points.append([float(lon), float(lat)])
+
+        # Ensure polygon is closed
+        if points[0] != points[-1]:
+            points.append(points[0])
+
+        polygons.append(points)
+
+    if not polygons:
+        raise ValueError("No polygon found in KML")
+
+    # If single polygon
+    if len(polygons) == 1:
+        return ee.Geometry.Polygon(polygons[0])
+
+    # If multiple polygons → MultiPolygon
+    return ee.Geometry.MultiPolygon([ [p] for p in polygons ])
 
 # --------------------------------------------------
 # Sentinel-2 Collection
