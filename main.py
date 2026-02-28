@@ -194,13 +194,15 @@ async def forest_loss(
         area_ha = aoi_area_ha.getInfo()
 
         if area_ha < 2000:
-            min_pixels = 20      # small block / village
+            min_pixels = 10      # small block / village
         elif area_ha < 10000:
-            min_pixels = 60      # sub-district
+            min_pixels = 20      # sub-district
+        elif area_ha < 25000:
+            min_pixels = 30
         elif area_ha < 50000:
             min_pixels = 100     # district
         else:
-            min_pixels = 250     # very large district/state
+            min_pixels = 500     # very large district/state
 
         # ---------------------------
         # Date ranges (Oct–Nov window)
