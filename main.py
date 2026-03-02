@@ -196,13 +196,13 @@ async def forest_loss(
         if area_ha < 2000:
             min_pixels = 10      # small block / village
         elif area_ha < 10000:
-            min_pixels = 20      # sub-district
+            min_pixels = 30      # sub-district
         elif area_ha < 25000:
-            min_pixels = 30
+            min_pixels = 50
         elif area_ha < 50000:
             min_pixels = 100     # district
         else:
-            min_pixels = 500     # very large district/state
+            min_pixels = 1000     # very large district/state
 
         # ---------------------------
         # Date ranges (Oct–Nov window)
