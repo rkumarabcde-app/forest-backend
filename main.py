@@ -286,13 +286,8 @@ async def forest_loss(
     # - No server memory used (data streams directly from GEE)
     # --------------------------------------------------
     try:
-        loss_url = significant_loss.getDownloadURL({
-            "format": "GeoJSON"
-        })
-
-        centroid_url = centroids.getDownloadURL({
-            "format": "GeoJSON"
-        })
+        loss_url = significant_loss.getDownloadURL(filetype="geojson")
+        centroid_url = centroids.getDownloadURL(filetype="geojson")
 
     except Exception as e:
         raise HTTPException(
