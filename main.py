@@ -225,8 +225,6 @@ async def forest_loss(
         # ---------------------------
 
         forest_loss = ndvi_change.lt(-0.2).selfMask()
-        connected = forest_loss.connectedPixelCount(500, True)
-        forest_loss = forest_loss.updateMask(connected.gte(10))
 
         # Connected components
         clusters = forest_loss.connectedComponents(
