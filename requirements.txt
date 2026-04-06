@@ -1,4 +1,5 @@
 fastapi
 uvicorn
 earthengine-api
-python-multipart
+pydantic
+requests
