@@ -1,10 +1,7 @@
 import ee
 import json
 import os
-import uuid
-import xml.etree.ElementTree as ET
-
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 # --------------------------------------------------
@@ -12,16 +9,18 @@ from fastapi.middleware.cors import CORSMiddleware
 # --------------------------------------------------
 
 credentials_json = os.getenv("GEE_CREDENTIALS_JSON")
+
 if not credentials_json:
-    raise RuntimeError("GEE_CREDENTIALS_JSON environment variable not set")
+    raise RuntimeError("GEE_CREDENTIALS_JSON not set")
 
 credentials_dict = json.loads(credentials_json)
 
-ee_credentials = ee.ServiceAccountCredentials(
+credentials = ee.ServiceAccountCredentials(
     credentials_dict["client_email"],
     key_data=credentials_json
 )
-ee.Initialize(ee_credentials)
+
+ee.Initialize(credentials)
 
 # --------------------------------------------------
 # FastAPI Setup
@@ -31,274 +30,263 @@ app = FastAPI(title="Forest Loss API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"],   
+    allow_methods=["POST"],   
+    allow_headers=["*"]
 )
 
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
 # --------------------------------------------------
-# Helper: Convert KML to EE Geometry
+# Tile Visualization Parameters
 # --------------------------------------------------
 
-def kml_to_ee_geometry(kml_path: str):
-    """Parse a KML file and return an ee.Geometry (Polygon or MultiPolygon)."""
-    tree = ET.parse(kml_path)
-    root = tree.getroot()
-    ns = {"kml": "http://www.opengis.net/kml/2.2"}
-    polygons = []
-
-    for coords in root.findall(
-        ".//kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", ns
-    ):
-        coord_text = coords.text.strip()
-        points = []
-        for line in coord_text.split():
-            lon, lat, *_ = line.split(",")
-            points.append([float(lon), float(lat)])
-
-        # Ensure polygon is closed
-        if points[0] != points[-1]:
-            points.append(points[0])
-
-        polygons.append(points)
-
-    if not polygons:
-        raise ValueError("No polygon found in KML file")
-
-    if len(polygons) == 1:
-        return ee.Geometry.Polygon(polygons[0])
-
-    return ee.Geometry.MultiPolygon([[p] for p in polygons])
+VIS_PARAMS = {
+    "palette": ["FF0000"],   # Red fill
+    "opacity": 1          
+}
 
 # --------------------------------------------------
-# Sentinel-2 NDVI  (year >= 2017)
+# Sentinel-2 Collection
 # --------------------------------------------------
 
-def get_sentinel_ndvi(start, end, aoi):
-    """Return a cloud-masked Sentinel-2 NDVI image for the given date range."""
+def get_sentinel(start, end, aoi):
 
     def mask_s2_clouds(image):
         scl = image.select("SCL")
         mask = (
-            scl.neq(3)    # cloud shadow
+            scl.neq(3)
             .And(scl.neq(8))
             .And(scl.neq(9))
             .And(scl.neq(10))
-            .And(scl.neq(11))  # clouds / cirrus
+            .And(scl.neq(11))
         )
         return image.updateMask(mask)
-
+    region = aoi.bounds().buffer(20000)
     collection = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(start, end)
-        .filterBounds(aoi)
+        .filterBounds(region)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
         .map(mask_s2_clouds)
     )
 
     if collection.size().getInfo() == 0:
-        raise ValueError("No Sentinel-2 images found for the selected date range")
+        raise ValueError("No Sentinel images found for selected dates")
 
     return (
-        collection.median()
-        .select(["B4", "B8"])
-        .normalizedDifference(["B8", "B4"])
-        .rename("NDVI")
-        .clip(aoi)
+        collection
+        .median()
+        .select(["B2","B3","B4", "B8"])
+    )
+
+def get_sentinel_ndvi (image, aoi):
+        collection = image.clip(aoi).normalizedDifference(["B8", "B4"])
+        return (
+        collection
     )
 
 # --------------------------------------------------
-# Landsat NDVI  (year < 2017)
+# Landsat NDVI Collection
 # --------------------------------------------------
 
-def get_landsat_ndvi(start, end, aoi):
-    """Return a cloud-masked Landsat NDVI image (TM/ETM+/OLI) for the given date range."""
+def get_landsat(start, end, aoi):
 
     def mask_landsat(image):
         qa = image.select("QA_PIXEL")
-        cloud  = qa.bitwiseAnd(1 << 3).neq(0)
+        cloud = qa.bitwiseAnd(1 << 3).neq(0)
         shadow = qa.bitwiseAnd(1 << 4).neq(0)
         return image.updateMask(cloud.Or(shadow).Not())
 
-    def scale_optical(image):
+    def scale(image):
         optical = image.select("SR_B.*").multiply(0.0000275).add(-0.2)
-        return image.addBands(optical, None, True)
-
-    def add_ndvi(image):
-        # Landsat 8/9 → SR_B5 (NIR), SR_B4 (Red)
-        # Landsat 5/7 → SR_B4 (NIR), SR_B3 (Red)
-        ndvi_oli = image.normalizedDifference(["SR_B5", "SR_B4"])
-        ndvi_tm  = image.normalizedDifference(["SR_B4", "SR_B3"])
-        return ee.Image(
-            ee.Algorithms.If(
-                image.bandNames().contains("SR_B5"),
-                ndvi_oli,
-                ndvi_tm
-            )
-        ).rename("NDVI")
-
+        return image.addBands(optical, overwrite=True)
+    region = aoi.bounds().buffer(20000)
     collection = (
         ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
         .merge(ee.ImageCollection("LANDSAT/LE07/C02/T1_L2"))
         .merge(ee.ImageCollection("LANDSAT/LC08/C02/T1_L2"))
         .merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
         .filterDate(start, end)
-        .filterBounds(aoi)
+        .filterBounds(region)
         .map(mask_landsat)
-        .map(scale_optical)
-        .map(add_ndvi)
+        .map(scale)
     )
+    return collection.select(["SR_B1","SR_B2","SR_B3","SR_B4","SR_B5"]).median()
 
-    return collection.select("NDVI").median().clip(aoi)
+def landsat_ndvi(image, aoi):
+    image1 = image.clip(aoi)
+    ndvi_oli = image1.normalizedDifference(["SR_B5", "SR_B4"])
+    ndvi_tm  = image1.normalizedDifference(["SR_B4", "SR_B3"])
+    return ee.Image(
+        ee.Algorithms.If(
+            image1.bandNames().contains("SR_B5"),
+            ndvi_oli,
+            ndvi_tm
+        )
+    ).rename("NDVI")
 
-# --------------------------------------------------
-# Pick correct sensor per year
-# --------------------------------------------------
-
-def get_ndvi_for_year(year: int, start, end, aoi):
-    """Return NDVI image using Sentinel-2 (>=2017) or Landsat (<2017)."""
+# For imagery of base and comparison years
+def get_rgb_image_url(year, start, end, aoi):
     if year >= 2017:
-        return get_sentinel_ndvi(start, end, aoi)
-    return get_landsat_ndvi(start, end, aoi)
-
-# --------------------------------------------------
-# API Endpoint: Detect forest loss and return URLs
-# --------------------------------------------------
-
-@app.post("/forest-loss")
-async def forest_loss(
-    year1: int       = Form(...),
-    year2: int       = Form(...),
-    threshold: float = Form(...),
-    kml: UploadFile  = File(...)
-):
-    """
-    Detect forest loss between two years within the uploaded KML boundary.
-
-    - year1      : Baseline year
-    - year2      : Comparison year
-    - threshold  : Minimum patch area in square metres (e.g. 5000 = 0.5 ha)
-    - kml        : KML file defining the area of interest
-
-    Returns GeoJSON download URLs that expire after ~1 hour.
-    """
-
-    # --------------------------------------------------
-    # Validate file type
-    # --------------------------------------------------
-    if not kml.filename.endswith(".kml"):
-        raise HTTPException(status_code=400, detail="Only KML files are accepted")
-
-    # --------------------------------------------------
-    # Save uploaded KML
-    # --------------------------------------------------
-    unique_name = f"{uuid.uuid4()}.kml"
-    kml_path    = os.path.join(UPLOAD_DIR, unique_name)
-
-    with open(kml_path, "wb") as f:
-        f.write(await kml.read())
-
-    try:
-        aoi = kml_to_ee_geometry(kml_path)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    # --------------------------------------------------
-    # Determine minimum connected pixels based on AOI size
-    # --------------------------------------------------
-    area_ha = aoi.area(maxError=1).divide(10000).getInfo()
-
-    if area_ha < 2000:
-        min_pixels = 10
-    elif area_ha < 10000:
-        min_pixels = 30
-    elif area_ha < 25000:
-        min_pixels = 50
-    elif area_ha < 50000:
-        min_pixels = 100
+        img = get_sentinel(start, end, aoi)
+        rgb = img.select(["B4", "B3", "B2"])
+        vis = {"min": 0, "max": 3000}
     else:
-        min_pixels = 1000
+        img = get_landsat(start, end, aoi)
+        band_names = img.bandNames()
+        rgb = ee.Image(
+        ee.Algorithms.If(
+            band_names.contains("SR_B4"),
+            img.select(["SR_B4", "SR_B3", "SR_B2"]),  # L8/9
+            img.select(["SR_B3", "SR_B2", "SR_B1"])   # L5/7
+        )
+        )
+        vis = {"min": 0, "max": 0.3}
 
-    # --------------------------------------------------
-    # Date windows: October – November
-    # --------------------------------------------------
-    start1 = ee.Date.fromYMD(year1, 10, 1)
-    end1   = ee.Date.fromYMD(year1, 11, 30)
-    start2 = ee.Date.fromYMD(year2, 10, 1)
-    end2   = ee.Date.fromYMD(year2, 11, 30)
+    return rgb.visualize(**vis).getMapId()["tile_fetcher"].url_format
 
-    # --------------------------------------------------
-    # Compute NDVI for each year and derive change
-    # --------------------------------------------------
+# --------------------------------------------------
+# Helper: Build Styled Tile Layer
+# --------------------------------------------------
+
+def get_tile_url(image):
+    map_id = image.getMapId()
+    return map_id["tile_fetcher"].url_format
+
+# --------------------------------------------------
+# API Endpoint
+# --------------------------------------------------
+
+from pydantic import BaseModel
+
+class AnalysisRequest(BaseModel):
+    year1: int
+    year2: int
+    threshold: float
+    geometry: dict
+@app.post("/forest-loss")
+async def forest_loss(data: AnalysisRequest):
+
     try:
-        ndvi1 = get_ndvi_for_year(year1, start1, end1, aoi)
-        ndvi2 = get_ndvi_for_year(year2, start2, end2, aoi)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
-    ndvi_change = ndvi2.subtract(ndvi1).rename("NDVI_change")
+        year1 = data.year1
+        year2 = data.year2
+        threshold = data.threshold
+        geometry = data.geometry
 
-    # --------------------------------------------------
-    # Forest loss detection
-    # --------------------------------------------------
-    scale = 10 if year2 >= 2017 else 30
+        aoi = ee.Geometry(geometry)
 
-    # Pixels with NDVI drop > 0.2 are flagged as potential loss
-    raw_loss = ndvi_change.lt(-0.2).selfMask()
+        # ---------------------------
+        # Date ranges (Oct–Nov window)
+        # ---------------------------
 
-    # Remove isolated pixels — keep connected patches >= min_pixels
-    connected   = raw_loss.connectedPixelCount(500, True)
-    forest_loss_img = raw_loss.updateMask(connected.gte(min_pixels))
+        start1 = ee.Date.fromYMD(year1, 10, 1)
+        end1   = ee.Date.fromYMD(year1, 11, 30)
 
-    # Vectorize into polygon patches
-    clusters = forest_loss_img.connectedComponents(ee.Kernel.square(1), 512)
+        start2 = ee.Date.fromYMD(year2, 10, 1)
+        end2   = ee.Date.fromYMD(year2, 11, 30)
 
-    vectors = clusters.select("labels").reduceToVectors(
-        geometry=aoi,
-        scale=scale,
-        geometryType="polygon",
-        eightConnected=True,
-        maxPixels=1e13,
-        reducer=ee.Reducer.countEvery()
-    )
+        # ---------------------------
+        # NDVI per year
+        # ---------------------------
 
-    # --------------------------------------------------
-    # Filter patches by minimum area threshold
-    # --------------------------------------------------
-    vectors = vectors.map(
-        lambda f: f.set("area_m2", f.geometry().area(maxError=1))
-    )
+        def get_ndvi(year, start, end, aoi):
+            if year >= 2017:
+                img = get_sentinel(start, end, aoi)
+                ndvi = get_sentinel_ndvi(img, aoi)
+            else:
+                img = get_landsat(start, end, aoi)
+                ndvi = landsat_ndvi(img, aoi)
+            return ndvi.rename("NDVI")
 
-    significant_loss = vectors.filter(ee.Filter.gte("area_m2", threshold))
+        ndvi1 = get_ndvi(year1, start1, end1, aoi)
+        ndvi2 = get_ndvi(year2, start2, end2, aoi)
 
-    # Centroid of each loss patch
-    centroids = significant_loss.map(lambda f: f.centroid(maxError=1))
+        ndvi_change = ndvi2.subtract(ndvi1)
 
-    # --------------------------------------------------
-    # Generate direct GeoJSON download URLs via GEE
-    #
-    # - No Drive export required
-    # - No polling required — URLs returned immediately
-    # - URLs expire after approximately 1 hour
-    # - No server memory used (data streams directly from GEE)
-    # --------------------------------------------------
-    try:
-        loss_url = significant_loss.getDownloadURL(filetype="geojson")
-        centroid_url = centroids.getDownloadURL(filetype="geojson")
+        # ---------------------------
+        # Forest loss mask
+        # ---------------------------
 
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate download URLs: {str(e)}"
+        forest_loss_mask = ndvi_change.lt(-0.2).selfMask()
+
+        # Connected components to isolate patches
+        clusters = forest_loss_mask.connectedComponents(
+            ee.Kernel.square(1), 512
+        )
+        labels = clusters.select("labels")
+
+        # Mask patches smaller than threshold using pixelArea
+        patch_area = ee.Image.pixelArea().updateMask(forest_loss_mask)
+
+        patch_sum = patch_area.addBands(labels).reduceConnectedComponents(
+            reducer=ee.Reducer.sum(),
+            labelBand="labels"
+        )
+        large_patch_mask = patch_sum.gte(1000)
+        forest_loss_mask = forest_loss_mask.updateMask(large_patch_mask)
+
+        # Centroid generation
+        # Add lon/lat bands to the masked patch image
+        lonlat = ee.Image.pixelLonLat()
+
+        # Compute the mean lon/lat within each connected patch
+        centroids_image = lonlat.addBands(labels).reduceConnectedComponents(
+            reducer=ee.Reducer.mean(),
+            labelBand="labels"
         )
 
-    return {
-        "status": "completed",
-        "forest_loss_url": loss_url,
-        "centroids_url": centroid_url,
-        "area_ha": round(area_ha, 2),
-        "note": "Download URLs expire after approximately 1 hour"
-    }
+        # Apply the large-patch threshold mask
+        centroids_image = centroids_image.updateMask(patch_sum.gte(threshold))
+
+        # Sample the result to get a list of coordinates
+        points = centroids_image.sample(
+            region=aoi,
+            scale = 10 if year2 >= 2017 else 30,
+            geometries=True
+        ).distinct(["longitude", "latitude"])
+
+        points_geojson = points.getInfo()
+
+        loss_filled = forest_loss_mask.gt(0).selfMask()
+
+        #edge = loss_filled.focal_max(1).subtract(loss_filled.focal_min(1)).selfMask()
+
+        styled_loss = loss_filled.visualize(palette=["FF0000"], opacity=1)
+        #styled_outline = edge.visualize(palette=["FF0000"], opacity=1)
+
+        #final_styled = ee.ImageCollection([styled_loss, styled_outline]).mosaic()
+
+        # ---------------------------
+        # Generate tile URLs — no getInfo() on vectors
+        # ---------------------------
+
+        tile_url = get_tile_url(styled_loss)
+        base_rgb_tile = get_rgb_image_url(year1, start1, end1, aoi)
+        comp_rgb_tile = get_rgb_image_url(year2, start2, end2, aoi)
+
+        # ---------------------------
+        # AOI bounds for map centering
+        # (single small getInfo call — just 4 numbers)
+        # ---------------------------
+
+        bounds = aoi.bounds().getInfo()["coordinates"][0]
+        lons   = [pt[0] for pt in bounds]
+        lats   = [pt[1] for pt in bounds]
+
+        return {
+            "tile_url": tile_url,               # Forest loss
+            "centroids": points_geojson,
+            "base_rgb_tile": base_rgb_tile,
+            "comp_rgb_tile": comp_rgb_tile,
+            "year1": year1,
+            "year2": year2,
+            "bounds": {
+                "min_lon": min(lons),
+                "max_lon": max(lons),
+                "min_lat": min(lats),
+                "max_lat": max(lats),
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
